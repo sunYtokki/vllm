@@ -2240,29 +2240,17 @@ class GPUModelRunner(
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:
-                    # Calculate the number of embeddings before start_idx using the mask
-                    num_embeds_before = (
-                        is_embed[:start_idx].sum().item() if start_idx > 0 else 0
-                    )
-                    num_embeds_in_range = is_embed[start_idx:end_idx].sum().item()
-
-                    # Slice the cached encoder output using the actual embedding indices
-                    mm_embeds_item = encoder_output[
-                        num_embeds_before : num_embeds_before + num_embeds_in_range
-                    ]
-
-                    # Update the is_embed mask for the scheduled tokens
                     is_embed = is_embed[start_idx:end_idx]
-                else:
-                    # No mask: all positions are embeddings
-                    mm_embeds_item = encoder_output[start_idx:end_idx]
-                    is_embed = None
+
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx)
+                )
+                mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
 
                 req_start_pos = req_start_idx + start_pos - num_computed_tokens
                 is_mm_embed[req_start_pos + start_idx : req_start_pos + end_idx] = (
                     True if is_embed is None else is_embed
                 )
-
                 mm_embeds_req.append(mm_embeds_item)
 
             if self.is_multimodal_pruning_enabled and self.uses_mrope:
@@ -4472,10 +4460,6 @@ class GPUModelRunner(
                         dummy_encoder_outputs,
                         expected_num_items=max_mm_items_per_batch,
                     )
-
-                    # Store each output as a raw tensor (matching runtime format)
-                    # with unique keys for profiling. This ensures the cache stores
-                    # only actual embeddings, not scattered placeholders.
                     for i, output in enumerate(dummy_encoder_outputs):
                         self.encoder_cache[f"tmp_{i}"] = output
 

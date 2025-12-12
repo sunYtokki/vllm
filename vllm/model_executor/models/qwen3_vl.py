@@ -703,7 +703,6 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
             num_frames=self.get_num_frames_with_most_features(seq_len, mm_counts),
             image_processor=None,
         )
-
         return num_video_soft_tokens
 
     def _calculate_timestamps(
