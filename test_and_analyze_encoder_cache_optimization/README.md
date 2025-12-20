@@ -1,127 +1,116 @@
-# Encoder Cache Optimization: Tests & Analysis
+# HPML Project: Encoder Cache Optimization in vLLM
 
-This directory contains test scripts and analysis tools for validating the **vLLM encoder cache optimization** for Qwen3-VL models. The tests measure KV cache memory improvements and ensure model quality is preserved (guardrail tests).
-
-## Overview
-
-The encoder cache optimization reduces GPU memory consumption by efficiently caching vision encoder outputs, resulting in:
-- **More available KV cache memory**
-- **Higher token capacity**
-- **Increased max concurrency** (more simultaneous requests)
-
----
-
-## Directory Contents
-
-```
-test_and_analyze_encoder_cache_optimization/
-├── README.md                              # This file
-├── analyze_wandb_results.py               # Analysis & plotting tool
-├── test_qwen3_wandb_benchmark_test.py     # Memory benchmark test
-├── test_qwen3_wandb_image_guardrail_test.py  # Functional image test
-└── test_qwen3_wandb_video_guardrail_test.py  # Functional video test
-```
+## Team Information
+- **Team Name**: vLLM Optimizers
+- **Members**:
+  - Sun Kim (syk2145)
+  - Wen Liang (wl2904)
+  - Ryan Sherby (rms2289)
+  - Kyle Yang (ky2578)
 
 ---
 
-## Test Scripts
+## 🔗 Quick Links
 
-### 1. Memory Benchmark Test
-**File:** `test_qwen3_wandb_benchmark_test.py`
-
-Measures raw KV cache metrics without running inference. Fast way to compare memory improvements across branches.
-
-```bash
-python test_qwen3_wandb_benchmark_test.py \
-    --model Qwen/Qwen3-VL-2B-Instruct \
-    --branch sun-optimized
-```
-
-**Metrics logged:**
-- `available_kv_cache_memory_gib` - Available KV cache memory in GiB
-- `kv_cache_size_tokens` - KV cache capacity in tokens
-- `max_concurrency` - Maximum concurrent requests supported
+| Resource | Link |
+|----------|------|
+| **📄 Paper (Overleaf)** | [https://www.overleaf.com/read/nzkngcvpwskr#ce0a1b](https://www.overleaf.com/read/nzkngcvpwskr#ce0a1b) |
+| **💻 Optimization Commits** | [https://github.com/sunYtokki/vllm/commits/hpml/final_project](https://github.com/sunYtokki/vllm/commits/hpml/final_project) |
+| **📊 WandB Project Board** | [https://wandb.ai/wl2904-columbia-university/vllm-encoder-cache-optimization](https://wandb.ai/wl2904-columbia-university/vllm-encoder-cache-optimization) |
+| **✅ Merged PR (Upstream)** | [https://github.com/vllm-project/vllm/commit/f5f51e5](https://github.com/vllm-project/vllm/commit/f5f51e5931ffd99afe69696b60765b88d3eb13f2) |
 
 ---
 
-### 2. Functional Image Test (Guardrail)
-**File:** `test_qwen3_wandb_image_guardrail_test.py`
+## 1. Problem Statement
 
-Tests image understanding quality while measuring KV cache metrics. Ensures optimization doesn't degrade model accuracy.
+Multimodal large language models (LLMs) like Qwen3-VL insert **placeholder tokens** (timestamps, delimiters, padding) into the token sequence, but only a fraction correspond to actual **encoder embeddings**. The baseline vLLM design allocates cache memory for *all* placeholder tokens, leading to severe memory waste.
 
-```bash
-python test_qwen3_wandb_image_guardrail_test.py \
-    --model Qwen/Qwen3-VL-2B-Instruct \
-    --branch sun-optimized \
-    --num-images 10
-```
+**Example:** For a Qwen3-VL video input with 100 timestamps:
+- **Baseline:** Allocates 1,200 cache slots (12 placeholders × 100 timestamps)
+- **Actual embeddings:** Only 100 (one per timestamp)
+- **Waste:** 91.7% of encoder cache memory is unused
 
-**Metrics logged:**
-- KV cache metrics (memory, tokens, concurrency)
-- `avg_accuracy` - Average accuracy on keyword matching
-- Per-image accuracy and generation time
+**Our Goal:** Optimize the encoder cache to store only actual embeddings while maintaining O(1) scheduler queries and preserving model accuracy.
 
 ---
 
-### 3. Functional Video Test (Guardrail)
-**File:** `test_qwen3_wandb_video_guardrail_test.py`
+## 2. Model Description
 
-Tests video understanding quality while measuring KV cache metrics.
+### Framework
+- **Inference Engine:** [vLLM](https://github.com/vllm-project/vllm) (PyTorch-based)
+- **Target Models:** Qwen3-VL family (2B, 4B, 8B parameters)
 
-```bash
-python test_qwen3_wandb_video_guardrail_test.py \
-    --model Qwen/Qwen3-VL-4B-Instruct \
-    --branch sun-optimized \
-    --num-videos 5
-```
+### Architecture
+- **Model Type:** Vision-Language Model (VLM) with encoder-decoder architecture
+- **Vision Encoder:** ViT-based image/video encoder
+- **Language Model:** Qwen3 decoder with multimodal fusion
 
-**Metrics logged:**
-- KV cache metrics (memory, tokens, concurrency)
-- `avg_accuracy` - Average accuracy on keyword matching
-- Per-video accuracy and generation time
+### Key Modifications
+| Component | Change |
+|-----------|--------|
+| `PlaceholderRange` | Added `is_embed` boolean mask to identify actual embeddings |
+| `EncoderCacheManager` | Cache allocates only for `is_embed=True` positions |
+| `Scheduler` | Cumulative sum indexing for O(1) range-to-embedding queries |
+| `Profiler` | `get_mm_max_tokens()` returns embedding counts instead of placeholder counts |
 
 ---
 
-## Analysis Tool
+## 3. Final Results Summary
 
-### `analyze_wandb_results.py`
+### Memory Benchmark Results
 
-Fetches results from Weights & Biases and generates comparison plots.
+| Model | Baseline KV Memory | Optimized KV Memory | Improvement |
+|-------|-------------------|---------------------|-------------|
+| Qwen3-VL-8B-FP8 | 4.12 GiB | 8.45 GiB | **+105.1%** |
+| Qwen3-VL-4B | 7.57 GiB | 10.29 GiB | **+35.9%** |
+| Qwen3-VL-2B | 12.55 GiB | 14.69 GiB | **+17.0%** |
 
-#### Memory Benchmark Analysis
+### Concurrency & Capacity
+
+| Model | Baseline Tokens | Optimized Tokens | Baseline Concurrency | Optimized Concurrency |
+|-------|-----------------|------------------|---------------------|----------------------|
+| Qwen3-VL-8B-FP8 | 29,968 | 61,536 | 7.32 | **15.02** |
+| Qwen3-VL-4B | 55,136 | 74,912 | 13.46 | **18.29** |
+| Qwen3-VL-2B | 117,520 | 137,520 | 28.69 | **33.57** |
+
+### Accuracy Preservation (Guardrail Validation)
+
+| Model | Image Accuracy (Baseline) | Image Accuracy (Optimized) | Video Accuracy (Baseline) | Video Accuracy (Optimized) |
+|-------|---------------------------|----------------------------|---------------------------|----------------------------|
+| Qwen3-VL-8B-FP8 | 71.8% | 71.8% ✓ | 33.0% | 33.0% ✓ |
+| Qwen3-VL-4B | 75.3% | 75.3% ✓ | 29.0% | 29.0% ✓ |
+| Qwen3-VL-2B | 66.4% | 66.4% ✓ | 36.0% | 36.0% ✓ |
+
+### Summary Metrics
+
+| Metric | Value |
+|--------|-------|
+| Max Memory Improvement | **+105.1%** (8B model) |
+| Max Concurrency Gain | **2.05×** (7.32 → 15.02) |
+| Accuracy Degradation | **0.0 pp** (all models) |
+| Device | NVIDIA A100 80GB |
+
+---
+
+## 4. Reproducibility Instructions
+
+### A. Requirements
+
+Install dependencies:
 ```bash
-python analyze_wandb_results.py --group memory-benchmark
-```
-**Output:** 3-panel bar chart comparing KV cache metrics across branches
+pip install wandb transformers qwen-vl-utils pandas matplotlib seaborn
 
-#### Functional Test Analysis
-```bash
-# Image guardrail tests
-python analyze_wandb_results.py --group functional-image
-
-# Video guardrail tests
-python analyze_wandb_results.py --group functional-video
-```
-**Output:** 2x2 panel chart with:
-1. Available KV Cache Memory (GiB)
-2. KV Cache Size (Tokens)
-3. Max Concurrency
-4. Average Accuracy (%) - Guardrail metric
-
-#### Custom Output Path
-```bash
-python analyze_wandb_results.py --group memory-benchmark --output my_comparison.png
+# For video tests
+pip install decord  # Preferred video backend
 ```
 
 ---
 
-## Weights & Biases Integration
+### B. WandB Dashboard
 
-All tests log results to **Weights & Biases** for tracking and comparison.
+View all training and evaluation metrics here:  
+**🔗 [WandB Dashboard](https://wandb.ai/wl2904-columbia-university/vllm-encoder-cache-optimization)**
 
-**Project:** `vllm-encoder-cache-optimization`
-
-**Groups:**
 | Group | Description |
 |-------|-------------|
 | `memory-benchmark` | Memory-only benchmark runs |
@@ -130,131 +119,151 @@ All tests log results to **Weights & Biases** for tracking and comparison.
 
 ---
 
-## Key Metrics
+### C. Running Benchmarks (Inference Only)
 
-### KV Cache Metrics (Optimization Proof)
-| Metric | Description |
-|--------|-------------|
-| `available_kv_cache_memory_gib` | GPU memory available for KV cache |
-| `kv_cache_size_tokens` | Number of tokens the KV cache can hold |
-| `max_concurrency` | Max concurrent requests (tokens / max_model_len) |
+This project focuses on **inference optimization** (no training involved).
 
-### Guardrail Metric (Quality Assurance)
-| Metric | Description |
-|--------|-------------|
-| `avg_accuracy` | Keyword-based accuracy on test prompts |
-
----
-
-## Supported Models
-
-| Model | Size | Notes |
-|-------|------|-------|
-| `Qwen/Qwen3-VL-2B-Instruct` | 2B | Fastest for testing |
-| `Qwen/Qwen3-VL-4B-Instruct` | 4B | Default for video tests |
-| `Qwen/Qwen3-VL-8B-Instruct-FP8` | 8B | FP8 quantized |
-
----
-
-## Results
-
-### Memory Benchmark (`memory-benchmark` group)
-
-KV cache memory improvements comparing `sun-optimized` vs `main` branch:
-
-| Model | Main (GiB) | Optimized (GiB) | KV Tokens | Max Concurrency | Improvement |
-|-------|------------|-----------------|-----------|-----------------|-------------|
-| Qwen3-VL-8B-Instruct-FP8 | 4.12 | 8.45 | 29,968 → 61,536 | 7.32 → 15.02 | **+105.1%** |
-| Qwen3-VL-4B-Instruct | 7.57 | 10.29 | 55,136 → 74,912 | 13.46 → 18.29 | **+35.9%** |
-| Qwen3-VL-2B-Instruct | 12.55 | 14.69 | 117,520 → 137,520 | 28.69 → 33.57 | **+17.0%** |
-
----
-
-### Functional Image Test (`functional-image` group)
-
-Image understanding quality guardrail test results:
-
-| Model | Main (GiB) | Optimized (GiB) | Memory Gain | Accuracy (main) | Accuracy (opt) |
-|-------|------------|-----------------|-------------|-----------------|----------------|
-| Qwen3-VL-8B-Instruct-FP8 | 3.93 | 8.31 | **+111.5%** | 71.8% | 71.8% ✓ |
-| Qwen3-VL-4B-Instruct | 7.46 | 10.20 | **+36.7%** | 75.3% | 75.3% ✓ |
-| Qwen3-VL-2B-Instruct | 12.46 | 14.62 | **+17.3%** | 66.4% | 66.4% ✓ |
-
-**Key Finding:** Accuracy is preserved (0.0 percentage point change) across all models with the optimization.
-
----
-
-### Functional Video Test (`functional-video` group)
-
-Video understanding quality guardrail test results:
-
-| Model | Main (GiB) | Optimized (GiB) | Memory Gain | Accuracy (main) | Accuracy (opt) |
-|-------|------------|-----------------|-------------|-----------------|----------------|
-| Qwen3-VL-8B-Instruct-FP8 | 3.93 | 8.31 | **+111.5%** | 33.0% | 33.0% ✓ |
-| Qwen3-VL-4B-Instruct | 7.46 | 10.20 | **+36.7%** | 29.0% | 29.0% ✓ |
-| Qwen3-VL-2B-Instruct | 12.46 | 14.62 | **+17.3%** | 36.0% | 36.0% ✓ |
-
-**Key Finding:** Video accuracy is identical between branches, confirming the optimization preserves model quality.
-
----
-
-### Summary
-
-| Metric | 8B-FP8 | 4B | 2B |
-|--------|--------|-----|-----|
-| **Memory Improvement** | +105-111% | +35-37% | +17% |
-| **Image Accuracy Preserved** | ✓ 71.8% | ✓ 75.3% | ✓ 66.4% |
-| **Video Accuracy Preserved** | ✓ 33.0% | ✓ 29.0% | ✓ 36.0% |
-
----
-
-## Quick Start
-
-### Run All Benchmarks
+#### Memory Benchmark
 ```bash
 cd test_and_analyze_encoder_cache_optimization
 
-# Run memory benchmark for all models
-for model in "Qwen/Qwen3-VL-2B-Instruct" "Qwen/Qwen3-VL-4B-Instruct" "Qwen/Qwen3-VL-8B-Instruct-FP8"; do
-    python test_qwen3_wandb_benchmark_test.py --model "$model" --branch sun-optimized
-done
-
-# Run image guardrail test
-python test_qwen3_wandb_image_guardrail_test.py --model Qwen/Qwen3-VL-2B-Instruct --num-images 10
-
-# Run video guardrail test
-python test_qwen3_wandb_video_guardrail_test.py --model Qwen/Qwen3-VL-4B-Instruct --num-videos 5
+python test_qwen3_wandb_benchmark_test.py \
+    --model Qwen/Qwen3-VL-2B-Instruct \
+    --branch sun-optimized
 ```
 
-### Analyze Results
+#### Image Guardrail Test
 ```bash
-# Generate comparison plots
+python test_qwen3_wandb_image_guardrail_test.py \
+    --model Qwen/Qwen3-VL-2B-Instruct \
+    --branch sun-optimized \
+    --num-images 10
+```
+
+#### Video Guardrail Test
+```bash
+python test_qwen3_wandb_video_guardrail_test.py \
+    --model Qwen/Qwen3-VL-4B-Instruct \
+    --branch sun-optimized \
+    --num-videos 5
+```
+
+---
+
+### D. Evaluation / Analysis
+
+Generate comparison plots from WandB data:
+```bash
 python analyze_wandb_results.py --group memory-benchmark
 python analyze_wandb_results.py --group functional-image
 python analyze_wandb_results.py --group functional-video
 ```
 
+**Output:** PNG files with side-by-side comparison charts.
+
+#### Memory Benchmark Results (`kv_cache_comparison_metrics.png`)
+![Memory Benchmark](kv_cache_comparison_metrics.png)
+
+#### Image Guardrail Results (`functional_image_comparison.png`)
+![Image Accuracy](functional_image_comparison.png)
+
+#### Video Guardrail Results (`functional_video_comparison.png`)
+![Video Accuracy](functional_video_comparison.png)
+
 ---
 
-## Skipping WandB Logging
+### E. Quickstart: Minimum Reproducible Result
 
-For local testing without WandB:
-
-```bash
-python test_qwen3_wandb_image_guardrail_test.py --no-wandb
-```
-
----
-
-## Requirements
+To reproduce our reported **+105% memory improvement** on Qwen3-VL-8B-FP8:
 
 ```bash
+# Step 1: Set up environment
 pip install wandb transformers qwen-vl-utils pandas matplotlib seaborn
+
+# Step 2: Navigate to test directory
+cd test_and_analyze_encoder_cache_optimization
+
+# Step 3: Run memory benchmark (baseline)
+python test_qwen3_wandb_benchmark_test.py \
+    --model Qwen/Qwen3-VL-8B-Instruct-FP8 \
+    --branch main
+
+# Step 4: Run memory benchmark (optimized)
+python test_qwen3_wandb_benchmark_test.py \
+    --model Qwen/Qwen3-VL-8B-Instruct-FP8 \
+    --branch sun-optimized
+
+# Step 5: Generate comparison plot
+python analyze_wandb_results.py --group memory-benchmark
 ```
 
-For video tests, also install:
-```bash
-pip install decord  # Preferred video backend
-# or
-pip install torchvision  # Fallback
+**Expected Output:**
+- Baseline: 4.12 GiB available KV cache
+- Optimized: 8.45 GiB available KV cache
+- Improvement: **+105.1%**
+
+### Execution Logs
+
+#### Memory Benchmark Results (`memory_benchmark_cmd.png`)
+![Memory Benchmark Log](memory_benchmark_cmd.png)
+
+#### Image Guardrail Results (`functional_image_cmd.png`)
+![Image Test Log](functional_image_cmd.png)
+
+#### Video Guardrail Results (`functional_video_cmd.png`)
+![Video Test Log](functional_video_cmd.png)
+
+---
+
+## 5. Repository Structure
+
 ```
+vllm/
+├── vllm/                                 # Core vLLM source code (modified)
+│   ├── multimodal/
+│   │   ├── inputs.py                     # PlaceholderRange with is_embed mask
+│   │   └── profiling.py                  # get_mm_max_tokens API
+│   └── v1/
+│       ├── core/
+│       │   ├── encoder_cache_manager.py  # Optimized cache allocation
+│       │   └── sched/scheduler.py        # Cumulative sum indexing
+│       └── worker/
+│           └── gpu_model_runner.py       # Sparse mask handling
+│
+├── test_and_analyze_encoder_cache_optimization/   # Benchmark & Analysis
+│   ├── README.md                                  # This file
+│   ├── final_report.tex                           # LaTeX paper source
+│   ├── analyze_wandb_results.py                   # Analysis & plotting tool
+│   ├── test_qwen3_wandb_benchmark_test.py         # Memory benchmark script
+│   ├── test_qwen3_wandb_image_guardrail_test.py   # Image guardrail script
+│   ├── test_qwen3_wandb_video_guardrail_test.py   # Video guardrail script
+│   ├── kv_cache_comparison_metrics.png            # Plot: Memory benchmark results
+│   ├── functional_image_comparison.png            # Plot: Image accuracy results
+│   ├── functional_video_comparison.png            # Plot: Video accuracy results
+│   └── *_cmd.png                                  # Execution log screenshots
+│
+└── tests/                                # Unit tests
+    ├── v1/core/test_encoder_cache_manager.py
+    └── multimodal/test_utils.py
+```
+
+---
+
+## 6. Key Observations
+
+1. **Memory savings scale with model size:** Larger models have proportionally larger vision encoders, making encoder cache optimization more impactful (+105% for 8B vs +17% for 2B).
+
+2. **Concurrency doubles for the largest model:** The 8B-FP8 model's max concurrency increases from 7.32 to 15.02 requests—a 2× improvement.
+
+3. **Zero quality degradation:** Accuracy remains identical (0.0 pp change) across all models for both image and video inputs.
+
+4. **Production impact:** This optimization has been [merged into upstream vLLM](https://github.com/vllm-project/vllm/commit/f5f51e5931ffd99afe69696b60765b88d3eb13f2).
+
+---
+
+## 7. Contact
+
+- Sun Kim: syk2145@columbia.edu
+- Wen Liang: wl2904@columbia.edu
+- Ryan Sherby: rms2289@columbia.edu
+- Kyle Yang: ky2578@columbia.edu
